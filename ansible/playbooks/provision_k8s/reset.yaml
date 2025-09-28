@@ -1,0 +1,77 @@
+---
+- name: Reset Kubernetes on all nodes
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # 0) Try to reset kubeadm even if cluster is half-broken
+    - name: kubeadm reset
+      command: kubeadm reset -f
+      ignore_errors: true
+
+    - name: Stop kubelet
+      systemd: { name: kubelet, state: stopped, enabled: no }
+      ignore_errors: true
+
+    # 1) Remove Kubernetes/CNI state
+    - name: Remove k8s/CNI directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /etc/cni/net.d
+        - /var/lib/cni
+        - /var/lib/kubelet
+        - /var/lib/calico
+      ignore_errors: true
+
+    # etcd data exists only on the control-plane (stacked etcd)
+    - name: Remove etcd data (control-plane only)
+      file:
+        path: /var/lib/etcd
+        state: absent
+      when: "'master' in group_names or 'controlplane' in group_names"
+      ignore_errors: true
+
+    # 2) Flush iptables/ipvs rules (what kubeadm suggests)
+    - name: Flush iptables (filter/nat/mangle) and delete chains
+      shell: |
+        iptables -F || true
+        iptables -t nat -F || true
+        iptables -t mangle -F || true
+        iptables -X || true
+      args: { executable: /bin/bash }
+
+    - name: Clear ipvs rules (if ipvs in use)
+      shell: ipvsadm -C || true
+      args: { executable: /bin/bash }
+      ignore_errors: true
+
+    # 3) Remove common CNI bridges/tunnels (ignore if missing)
+    - name: Delete common CNI/Calico links
+      shell: |
+        ip link del cni0    2>/dev/null || true
+        ip link del flannel.1 2>/dev/null || true
+        ip link del cali0   2>/dev/null || true
+        ip link del tunl0   2>/dev/null || true
+      args: { executable: /bin/bash }
+
+    # 4) (Optional) prune containerd k8s sandboxes/images
+    - name: Prune containerd k8s namespace (optional)
+      shell: |
+        crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock rm -f $(crictl ps -aq) 2>/dev/null || true
+        crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock rmi --prune -a 2>/dev/null || true
+      args: { executable: /bin/bash }
+      ignore_errors: true
+
+    # 5) Re-enable kubelet later; for now keep runtime up
+    - name: Restart containerd
+      systemd: { name: containerd, state: restarted, enabled: yes }
+
+    # 6) Reboot is the safest way to clear any lingering net state
+    - name: Reboot nodes
+      reboot:
+        msg: "Reboot to clear Kubernetes state"
+        reboot_timeout: 600

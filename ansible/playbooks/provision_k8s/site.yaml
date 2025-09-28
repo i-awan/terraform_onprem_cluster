@@ -1,0 +1,261 @@
+# site.yml
+---
+# -----------------------------------------------------------------------------
+# Play 1: Common prereqs on ALL nodes (containerd + kube* + sysctl/modules)
+# -----------------------------------------------------------------------------
+- name: Prep all nodes
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    k8s_deb_repo: "https://pkgs.k8s.io/core:/stable:/v1.30/deb/"
+    pod_cidr: "192.168.0.0/16"         # safe default, works with Calico/Flannel
+    kubernetes_version: "1.30.14"      # pin for kubeadm init
+
+  tasks:
+    - name: Disable swap immediately
+      command: swapoff -a
+      changed_when: false
+
+    - name: Comment swap in /etc/fstab (idempotent)
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*([^#]\S+\s+\S+\s+swap\s+\S+.*)$'
+        replace: '# \1'
+      register: swapped
+      failed_when: false
+
+    - name: Ensure kernel modules file present
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Load kernel modules now
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [overlay, br_netfilter]
+
+    - name: Sysctl for Kubernetes networking + forwarding
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables=1
+          net.bridge.bridge-nf-call-ip6tables=1
+          net.ipv4.ip_forward=1
+        mode: '0644'
+
+    - name: Apply sysctl
+      command: sysctl --system
+      changed_when: false
+
+    - name: Install base packages + containerd
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - containerd
+        update_cache: yes
+        state: present
+
+    - name: Ensure containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Write default containerd config
+      shell: "containerd config default > /etc/containerd/config.toml"
+      args: { creates: /etc/containerd/config.toml }
+
+    - name: Use systemd cgroups in containerd (K8s best practice)
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: (Optional) Use pause:3.9 to silence kubeadm warning
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'registry.k8s.io/pause:3\.8'
+        replace: 'registry.k8s.io/pause:3.9'
+      notify: Restart containerd
+
+    - name: Enable + start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Add Kubernetes apt repo key
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL {{ k8s_deb_repo }}Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repo
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] {{ k8s_deb_repo }} /
+        mode: '0644'
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        update_cache: yes
+        state: present
+
+  handlers:
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+# -----------------------------------------------------------------------------
+# Play 2: Control plane init (runs once on master)
+# -----------------------------------------------------------------------------
+- name: Init control plane on master
+  hosts: master
+  become: yes
+  gather_facts: yes
+
+  vars:
+    pod_cidr: "192.168.0.0/16"
+    kubernetes_version: "1.30.14"
+
+  tasks:
+    - name: Initialize control plane (idempotent)
+      command: >
+        kubeadm init
+        --pod-network-cidr={{ pod_cidr }}
+        --kubernetes-version=v{{ kubernetes_version }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+      # Ensure admin.conf exists (kubeadm init completed)
+    - name: Verify admin.conf exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: adminconf
+
+    - name: Fail if admin.conf missing
+      fail:
+        msg: "admin.conf not found. kubeadm init likely failed."
+      when: not adminconf.stat.exists
+
+    # Configure kubectl for root and ubuntu users
+    - name: Ensure kubeconfig dirs exist
+      file:
+        path: "{{ item.home }}/.kube"
+        state: directory
+        owner: "{{ item.user }}"
+        group: "{{ item.user }}"
+        mode: '0700'
+      loop:
+        - { user: root,   home: /root }
+        - { user: ubuntu, home: /home/ubuntu }
+
+    - name: Install kubeconfig for users (remote -> remote)
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ item.home }}/.kube/config"
+        owner: "{{ item.user }}"
+        group: "{{ item.user }}"
+        mode: '0600'
+        remote_src: true
+      loop:
+        - { user: root,   home: /root }
+        - { user: ubuntu, home: /home/ubuntu }
+
+    - name: Install Calico CNI (idempotent)
+      become: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+
+    - name: Wait for calico-node DaemonSet to roll out
+      become: yes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      shell: kubectl -n kube-system rollout status ds/calico-node --timeout=600s
+
+
+    # Wait until CoreDNS object exists (created by kubeadm) and becomes Available
+    - name: Wait for CoreDNS deployment to exist
+      environment: { KUBECONFIG: /etc/kubernetes/admin.conf }
+      shell: kubectl -n kube-system get deploy coredns
+      register: coredns_exists
+      retries: 60
+      delay: 5
+      until: coredns_exists.rc == 0
+
+    # install Calico here (unchanged)
+
+    - name: Generate kubeadm join command
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Share join command with workers
+      set_fact:
+        kubeadm_join_cmd: "{{ join_cmd.stdout }}"
+      delegate_facts: true
+
+# -----------------------------------------------------------------------------
+# Play 3: Join workers
+# -----------------------------------------------------------------------------
+- name: Join workers
+  hosts: workers
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Skip if this node already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join the cluster
+      command: "{{ hostvars[groups['master'][0]].kubeadm_join_cmd }} --v=3"
+      when: not kubelet_conf.stat.exists
+
+
+# -----------------------------------------------------------------------------
+# Play 4: Post-join health checks (run on master)
+# -----------------------------------------------------------------------------
+# - name: Post-join checks
+#   hosts: master
+#   become: yes
+#   gather_facts: no
+#   environment:
+#     KUBECONFIG: /etc/kubernetes/admin.conf
+
+#   tasks:
+#     # Wait until at least one non-control-plane node is Ready
+#     - name: Wait for any worker Ready
+#       shell: kubectl get nodes --no-headers | awk '$3=="Ready" && $2!~/control-plane/{ready++} END{exit ready<1}'
+#       register: nodes_ready
+#       retries: 60
+#       delay: 5
+#       until: nodes_ready.rc == 0
+
+#     # Calico daemonset fully scheduled & available
+#     - name: Wait for Calico node DaemonSet rollout
+#       shell: kubectl -n kube-system rollout status ds/calico-node --timeout=600s
+
+#     # Now CoreDNS can schedule on a worker and become Available
+#     - name: Wait for CoreDNS to be Available
+#       shell: kubectl -n kube-system wait --for=condition=Available deploy/coredns --timeout=600s
