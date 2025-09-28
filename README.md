@@ -51,7 +51,7 @@ variable "servers" {
 Where to write inventory & which playbook to run (note that the inventory file hosts.ini is constructed at run-time by Terraform.)
 ```hcl
 variable "ansible_inventory_path"         { default = "./hosts.ini" }
-variable "ansible_playbook_path"          { default = "./playbooks/site.yml" }
+variable "ansible_playbook_path"          { default = "./playbooks/site.yaml" }
 ```
 
 SSH details for Ansible
@@ -76,11 +76,10 @@ If your master doesn’t reliably get a private IP, pass k8s_private_ip via ansi
 terraform init -upgrade
 
 terraform apply -auto-approve \
-  -var="ansible_inventory_path=$(pwd)/hosts.ini" \
-  -var="ansible_playbook_path=$(pwd)/playbooks/site.yml" \
+  -var="ansible_inventory_path=./ansible/playbooks/provision_k8s/hosts.ini" \
+  -var="ansible_playbook_path=./ansible/playbooks/provision_k8s/site.yaml" \
   -var="ansible_user=ubuntu" \
-  -var="ansible_ssh_private_key_file=$HOME/.ssh/id_rsa" \
-  -var='ansible_extra_vars={"k8s_private_ip":"172.16.4.3"}'   # optional override
+  -var="ansible_ssh_private_key_file=$HOME/.ssh/id_rsa"
 ```
 
 What happens:
@@ -93,7 +92,7 @@ Old host keys for those IPs are removed from ~/.ssh/known_hosts (per IP).
 
 Terraform waits for SSH on each host.
 
-Ansible runs playbooks/site.yml against hosts.ini.
+Ansible runs playbooks/site.yaml against hosts.ini.
 
 To skip auto-Ansible for a run: add -var="run_ansible=false" and execute Ansible manually later.
 
@@ -125,8 +124,8 @@ terraform apply  -auto-approve
 Reset only Kubernetes (keep VMs):
 
 ```bash
-ansible-playbook -i hosts.ini playbooks/reset.yml --become
-ansible-playbook -i hosts.ini playbooks/site.yml  --become \
+ansible-playbook -i hosts.ini playbooks/reset.yaml --become
+ansible-playbook -i hosts.ini playbooks/site.yaml  --become \
   -e k8s_private_ip=<MASTER_PRIVATE_IP>   # optional explicit override
 ```
 
