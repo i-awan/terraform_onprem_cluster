@@ -9,7 +9,65 @@ A single `terraform apply`:
 - waits for SSH,
 - runs your Ansible playbook.
 
-> ⚠️ You’ll incur cloud costs while servers are running. Use `terraform destroy` when done.
+> ⚠️ You’ll incur cloud costs while servers are running. Use `terraform destroy` when done. 
+This set up will cost approximately €38/month (ex-VAT) for your current setup if you leave everything running 24/7. But prices may vary and have updated since this was last updated.
+
+--
+
+kraken.com/launch
+## Goal
+
+Stand up a real Kubernetes cluster (1 control-plane + 2 workers) cheaply and repeatably for hands-on MLOps/platform-engineering practice.
+
+How it works (pipeline)
+
+Terraform (Infra-as-Code)
+
+Provisions Scaleway compute instances + a private VPC network.
+
+Auto-allocates public IPs for SSH, attaches the private network for node-to-node traffic.
+
+Renders a dynamic Ansible inventory from the created IPs.
+
+Cleans stale SSH host keys, waits for SSH, then kicks off Ansible.
+
+Ansible (Config-as-Code)
+
+Preps every node: disables swap, loads kernel modules, sets sysctls, installs & configures containerd (systemd cgroups), installs kubeadm/kubelet/kubectl.
+
+Control-plane init on the master: kubeadm init using the private IP as the advertise address so cluster traffic stays internal.
+
+Installs Calico CNI so pods get networking.
+
+Workers join via the kubeadm join command.
+
+Configures kubectl for root and ubuntu on the master.
+
+Cluster ready
+
+Control-plane components run as static pods (managed by kubelet) on the master.
+
+Calico DaemonSet runs on all nodes; CoreDNS becomes available once a schedulable node exists.
+
+You can deploy workloads (e.g., NGINX) and expose them via NodePort (or later add Ingress/MetalLB).
+
+Design choices (why this way)
+
+Terraform for infra, Ansible for OS/Kubernetes → clean separation, easy to re-apply.
+
+Private advertise IP → secure, cheaper intra-VPC traffic; API not exposed by default.
+
+Idempotent playbooks → safe re-runs; separate reset.yml lets you wipe K8s without destroying VMs.
+
+Dynamic inventory + SSH hygiene → fully automated single-command bring-up.
+
+What you can do next
+
+Optionally expose the API safely (add public IP to cert SANs + firewall to your IP) or use an SSH tunnel.
+
+Add CI (validate Terraform/Ansible), add Ingress/MetalLB, or scale node counts via variables.
+
+In short: terraform apply builds the servers and hands off to Ansible, which turns them into a working Kubernetes cluster—repeatable, minimal, and interview-ready.
 
 ---
 
@@ -144,6 +202,41 @@ kubectl config set-cluster kubernetes \
   --kubeconfig ~/.kube/config.scaleway
 
 KUBECONFIG=~/.kube/config.scaleway kubectl get nodes
+```
+
+## Test Deployment
+
+Create 'demo' namespace
+```bash
+kubectl create namespace demo
+```
+
+Create test nginx deployment in demo namespace
+```bash
+kubectl create deployment nginx -n demo --image=nginx:1.27 --replicas=2
+```
+
+Verify
+```bash
+kubectl get deploy,pods -o wide -n demo
+kubectl rollout status deployment/nginx -n demo
+```
+
+(Optional) Expose the nginx deployment (NodePort)
+```bash
+kubectl expose deployment nginx --port=80 --type=NodePort --name=nginx -n demo
+```
+
+Get the NodePort
+```bash
+kubectl get svc -n demo
+NAME    TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+nginx   NodePort   10.111.39.76   <none>        80:30329/TCP   31s
+```
+
+Verify access to Nginx from browser
+```bash
+http://<WORKER_NODE_PUB_IP>:30329
 ```
 
 Public API (add SANs + firewall):
